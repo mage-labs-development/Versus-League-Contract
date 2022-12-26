@@ -1,15 +1,21 @@
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [package]
-name = "cis2_league_contract"
+name = "versus_league_contract"
 version = "0.1.0"
 edition = "2018"
 license = "MPL-2.0"
-authors = [ "CryptoSnowPrince <topdirector2017@gmail.com>" ]
-description = "CIS2-League-Contract"
+authors = [ "Mage Labs <development@magelabs.net>" ]
+description = "Versus-League-Contract"
+
+[features]
+default = ["std", "crypto-primitives"]
+crypto-primitives = ["concordium-std/crypto-primitives"]
+std = ["concordium-std/std", "concordium-cis2/std"]
 
 [dependencies]
-concordium-std = "4.0.0"
+concordium-std = {path = "../concordium-rust-smart-contracts/concordium-std", default-features = false}
+concordium-cis2 = {path = "../concordium-rust-smart-contracts/concordium-cis2", default-features = false}
 
 [lib]
 crate-type=["cdylib", "rlib"]

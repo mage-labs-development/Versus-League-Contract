@@ -2,20 +2,83 @@
 use concordium_cis2::{Cis2Event, *};
 use concordium_std::{collections::BTreeMap, *};
 
+/// The state tracked for each address.
+#[derive(Serialize, SchemaType)]
+struct PlayerData {
+    /// The player's state
+    state: PlayerState,
+    /// The player's battle result
+    results: Vec<BattleResult>,
+}
+
+/// The parameter type for the state contract function `updatePlayerState`.
+#[derive(Serialize, SchemaType)]
+struct UpdatePlayerStateParams {
+    /// Player to update state.
+    player: Address,
+    /// Active or Suspended
+    state: PlayerState,
+}
+
+/// The parameter type for the state contract function `updateBattleResult`.
+#[derive(Serialize, SchemaType)]
+struct UpdateBattleResultParams {
+    /// Player to update state.
+    player: Address,
+    /// Win or Loss
+    result: BattleResult,
+}
+
+/// List of supported standards by this contract address.
+const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 2] =
+    [CIS0_STANDARD_IDENTIFIER, CIS2_STANDARD_IDENTIFIER];
+
 /// The contract state.
 #[derive(Serial, DeserialWithState, StateClone)]
 #[concordium(state_parameter = "S")]
 struct State<S: HasStateApi> {
+    /// The admin address can upgrade the contract, pause and unpause the
+    /// contract, transfer the admin address to a new address, set
+    /// implementors, and update the metadata URL in the contract.
+    admin: Address,
     /// The state of the one player.
-    player_data:        StateMap<Address, PlayerData, S>,
+    player_data: StateMap<Address, PlayerData, S>,
     /// Contract is paused/unpaused.
-    paused:             bool,
+    paused: bool,
+    /// Map with contract addresses providing implementations of additional
+    /// standards.
+    implementors: StateMap<StandardIdentifierOwned, Vec<ContractAddress>, S>,
+}
+
+#[derive(Debug, Serialize, SchemaType, Clone, Copy, PartialEq)]
+enum PlayerState {
+    NotAdded,
+    Active,
+    Suspended,
+}
+
+#[derive(Debug, Serialize, SchemaType, Clone, Copy)]
+enum BattleResult {
+    NoResult,
+    Win,
+    Loss,
+}
+
+/// The parameter type for the contract function `setImplementors`.
+/// Takes a standard identifier and list of contract addresses providing
+/// implementations of this standard.
+#[derive(Debug, Serialize, SchemaType)]
+struct SetImplementorsParams {
+    /// The identifier for the standard.
+    id: StandardIdentifierOwned,
+    /// The addresses of the implementors of the standard.
+    implementors: Vec<ContractAddress>,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
 struct UpgradeParams {
     /// The new module reference.
-    module:  ModuleReference,
+    module: ModuleReference,
     /// Optional entrypoint to call in the new module after upgrade.
     migrate: Option<(OwnedEntrypointName, OwnedParameter)>,
 }
@@ -26,20 +89,9 @@ struct ReturnBasicState {
     /// The admin address can upgrade the contract, pause and unpause the
     /// contract, transfer the admin address to a new address, set
     /// implementors, and update the metadata URL in the contract.
-    admin:        Address,
+    admin: Address,
     /// Contract is paused if `paused = true` and unpaused if `paused = false`.
-    paused:       bool,
-    /// The metadata URL of the token.
-    metadata_url: concordium_cis2::MetadataUrl,
-}
-
-/// The parameter type for the contract function `setMetadataUrl`.
-#[derive(Serialize, SchemaType, Clone)]
-struct SetMetadataUrlParams {
-    /// The URL following the specification RFC1738.
-    url:  String,
-    /// The hash of the document stored at the above URL.
-    hash: Option<Sha256>,
+    paused: bool,
 }
 
 /// The parameter type for the contract function `setPaused`.
@@ -85,7 +137,9 @@ enum CustomContractError {
     FailedUpgradeUnsupportedModuleVersion,
 }
 
-type ContractResult<A> = Result<A, CustomContractError>;
+type ContractError = Cis2Error<CustomContractError>;
+
+type ContractResult<A> = Result<A, ContractError>;
 
 /// Mapping the logging errors to ContractError.
 impl From<LogError> for CustomContractError {
@@ -97,9 +151,11 @@ impl From<LogError> for CustomContractError {
     }
 }
 
-/// Mapping errors related to contract invocations to CustomContractError.
+/// Mapping errors related to contract invocations to ContractError.
 impl<T> From<CallContractError<T>> for CustomContractError {
-    fn from(_cce: CallContractError<T>) -> Self { Self::InvokeContractError }
+    fn from(_cce: CallContractError<T>) -> Self {
+        Self::InvokeContractError
+    }
 }
 
 /// Mapping errors related to contract upgrades to CustomContractError.
@@ -114,23 +170,37 @@ impl From<UpgradeError> for CustomContractError {
     }
 }
 
-/// Mapping CustomContractError to ContractError
-impl From<CustomContractError> for ContractError {
-    fn from(c: CustomContractError) -> Self { Cis2Error::Custom(c) }
-}
-
 impl<S: HasStateApi> State<S> {
     /// Creates the new state of the `state` contract with no one having any
     /// data by default. The ProtocolAddressesState is uninitialized.
     /// The ProtocolAddressesState has to be set with the `initialize`
     /// function after the `proxy` contract is deployed.
-    fn new(state_builder: &mut StateBuilder<S>) -> Self {
+    fn new(state_builder: &mut StateBuilder<S>, admin: Address) -> Self {
         // Setup state.
         State {
-            protocol_addresses: ProtocolAddressesState::UnInitialized,
-            player_data:        state_builder.new_map(),
-            paused:             false,
+            admin,
+            player_data: state_builder.new_map(),
+            paused: false,
+            implementors: state_builder.new_map(),
         }
+    }
+
+    /// Check if state contains any implementors for a given standard.
+    fn have_implementors(&self, std_id: &StandardIdentifierOwned) -> SupportResult {
+        if let Some(addresses) = self.implementors.get(std_id) {
+            SupportResult::SupportBy(addresses.to_vec())
+        } else {
+            SupportResult::NoSupport
+        }
+    }
+
+    /// Set implementors for a given standard.
+    fn set_implementors(
+        &mut self,
+        std_id: StandardIdentifierOwned,
+        implementors: Vec<ContractAddress>,
+    ) {
+        self.implementors.insert(std_id, implementors);
     }
 }
 
@@ -142,42 +212,39 @@ fn contract_init<S: HasStateApi>(
     _ctx: &impl HasInitContext,
     state_builder: &mut StateBuilder<S>,
 ) -> InitResult<State<S>> {
+    // Get the instantiator of this contract instance to be used as the initial
+    // admin.
+    let invoker = Address::Account(_ctx.init_origin());
     // Construct the initial contract state.
-    let state = State::new(state_builder);
+    let state = State::new(state_builder, invoker);
 
     Ok(state)
 }
 
-/// Update player state.
+/// Add new player.
 #[receive(
     contract = "Versus-League-Manager",
-    name = "updatePlayerState",
-    parameter = "UpdatePlayerStateParams",
+    name = "setPlayerData",
+    parameter = "(Address, PlayerState, BattleResult)",
     error = "CustomContractError",
     mutable
 )]
-fn contract_update_player_state<S: HasStateApi>(
+fn contract_state_set_player_data<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
-    let (_proxy_address, implementation_address) = get_protocol_addresses_from_state(host)?;
+    let params: (Address, PlayerState, BattleResult) = ctx.parameter_cursor().get()?;
 
-    // Only implementation can set state.
-    only_implementation(implementation_address, ctx.sender())?;
-
-    // update player state.
-    let params: UpdatePlayerStateParams = ctx.parameter_cursor().get()?;
-    let state = host.state();
-
-    let mut player_data = state.player_data.entry(params.player).or_insert_with(|| PlayerData {
-        state:   PlayerState::NotAdded,
-        result:  BattleResult::NoResult,
-    });
-    player_data.state = params.state;
-
-    // host.state_mut().player_data.entry(params.player).and_modify(|player_data| {
-    //     player_data.state = params.state
-    // })
+    //result should be empty vector
+    let mut player_data = host
+        .state_mut()
+        .player_data
+        .entry(params.0)
+        .or_insert_with(|| PlayerData {
+            state: PlayerState::Active,
+            results: Vec::new(),
+        });
+    player_data.state = params.1;
 
     Ok(())
 }
@@ -194,54 +261,16 @@ fn contract_update_battle_result<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
-    let (_proxy_address, implementation_address) = get_protocol_addresses_from_state(host)?;
-
-    // Only implementation can set result.
-    only_implementation(implementation_address, ctx.sender())?;
-
-    // update player state.
     let params: UpdateBattleResultParams = ctx.parameter_cursor().get()?;
-    let state = host.state();
-
-    let mut player_data = state.player_data.entry(params.player).or_insert_with(|| PlayerData {
-        state:   PlayerState::NotAdded,
-        result:  BattleResult::NoResult,
-    });
-    player_data.result = params.result;
-
-    // host.state_mut().player_data.entry(params.player).and_modify(|player_data| {
-    //     player_data.result = params.result
-    // })
-
-    Ok(())
-}
-
-/// Add new player with concordium id.
-#[receive(
-    contract = "Versus-League-Manager",
-    name = "addPlayer",
-    parameter = "Address",
-    error = "CustomContractError",
-    mutable
-)]
-fn contract_state_set_player_data<S: HasStateApi>(
-    ctx: &impl HasReceiveContext,
-    host: &mut impl HasHost<State<S>, StateApiType = S>,
-) -> ContractResult<()> {
-    let (_proxy_address, implementation_address) = get_protocol_addresses_from_state(host)?;
-
-    // Only implementation can set result.
-    only_implementation(implementation_address, ctx.sender())?;
-
-    // add new player.
-    let params: Address = ctx.parameter_cursor().get()?;
-    let state = host.state();
-
-    state.player_data.entry(params).or_insert_with(|| PlayerData {
-        state:   PlayerState::NotAdded,
-        result:  BattleResult::NoResult,
-    });
-
+    let mut player_data = host
+        .state_mut()
+        .player_data
+        .entry(params.player)
+        .or_insert_with(|| PlayerData {
+            state: PlayerState::Active,
+            results: Vec::new(),
+        });
+    player_data.results.push(params.result);
     Ok(())
 }
 
@@ -270,12 +299,12 @@ fn contract_state_get_paused<S: HasStateApi>(
 fn contract_state_get_player_data<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &impl HasHost<State<S>, StateApiType = S>,
-) -> ContractResult<(PlayerState, BattleResult)> {
+) -> ContractResult<(PlayerState, Vec<BattleResult>)> {
     let params: Address = ctx.parameter_cursor().get()?;
-    
+
     let player = host.state().player_data.get(&params).unwrap();
 
-    Ok((player.state, player.result))
+    Ok(( player.state, player.results.clone() ))
 }
 
 /// Check if player is added.
@@ -291,7 +320,7 @@ fn contract_state_is_added<S: HasStateApi>(
     host: &impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<bool> {
     let params: Address = ctx.parameter_cursor().get()?;
-    
+
     let player_state = host.state().player_data.get(&params).unwrap().state;
 
     Ok(player_state != PlayerState::NotAdded)
@@ -304,15 +333,12 @@ fn contract_state_is_added<S: HasStateApi>(
     return_value = "ReturnBasicState",
     error = "CustomContractError"
 )]
-fn contract_state_view<S: HasStateApi>(
+fn contract_view<S: HasStateApi>(
     _ctx: &impl HasReceiveContext,
     host: &impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<ReturnBasicState> {
-    let (proxy_address, implementation_address) = get_protocol_addresses_from_state(host)?;
-
     let state = ReturnBasicState {
-        proxy_address,
-        implementation_address,
+        admin: host.state().admin,
         paused: host.state().paused,
     };
     Ok(state)
@@ -328,7 +354,7 @@ fn contract_state_view<S: HasStateApi>(
     name = "supports",
     parameter = "SupportsQueryParams",
     return_value = "SupportsQueryResponse",
-    error = "ContractError"
+    error = "CustomContractError"
 )]
 fn contract_supports<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
@@ -360,7 +386,7 @@ fn contract_supports<S: HasStateApi>(
     contract = "Versus-League-Manager",
     name = "setImplementors",
     parameter = "SetImplementorsParams",
-    error = "ContractError",
+    error = "CustomContractError",
     mutable
 )]
 fn contract_set_implementor<S: HasStateApi>(
@@ -368,11 +394,16 @@ fn contract_set_implementor<S: HasStateApi>(
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
     // Check that only the admin is authorized to set implementors.
-    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
     // Parse the parameter.
     let params: SetImplementorsParams = ctx.parameter_cursor().get()?;
     // Update the implementors in the state
-    host.state_mut().set_implementors(params.id, params.implementors);
+    host.state_mut()
+        .set_implementors(params.id, params.implementors);
     Ok(())
 }
 
@@ -395,7 +426,7 @@ fn contract_set_implementor<S: HasStateApi>(
     contract = "Versus-League-Manager",
     name = "upgrade",
     parameter = "UpgradeParams",
-    error = "ContractError",
+    error = "CustomContractError",
     low_level
 )]
 fn contract_upgrade<S: HasStateApi>(

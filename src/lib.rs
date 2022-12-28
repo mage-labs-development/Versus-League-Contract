@@ -115,18 +115,17 @@ struct NewAdminEvent {
 enum CustomContractError {
     /// Failed parsing the parameter.
     #[from(ParseError)]
-    ParseParamsError,
-    /// Your error
+    ParseParams,
     /// Failed logging: Log is full.
     LogFull,
     /// Failed logging: Log is malformed.
     LogMalformed,
+    /// Contract is paused.
+    ContractPaused,
     /// Failed to invoke a contract.
     InvokeContractError,
-    /// Contract already initialized.
-    AlreadyInitialized,
-    /// Contract not initialized.
-    UnInitialized,
+    /// Failed to invoke a transfer.
+    InvokeTransferError,
     /// Upgrade failed because the new module does not exist.
     FailedUpgradeMissingModule,
     /// Upgrade failed because the new module does not contain a contract with a
@@ -233,6 +232,9 @@ fn contract_state_set_player_data<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
+    // Check that contract is not paused.
+    ensure!(!host.state().paused, ContractError::Custom(CustomContractError::ContractPaused));
+
     let params: (Address, PlayerState, BattleResult) = ctx.parameter_cursor().get()?;
 
     //result should be empty vector
@@ -261,6 +263,9 @@ fn contract_update_battle_result<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
+    // Check that contract is not paused.
+    ensure!(!host.state().paused, ContractError::Custom(CustomContractError::ContractPaused));
+    
     let params: UpdateBattleResultParams = ctx.parameter_cursor().get()?;
     let mut player_data = host
         .state_mut()

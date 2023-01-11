@@ -1,14 +1,16 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-use concordium_cis2::{Cis2Event, *};
-use concordium_std::{collections::BTreeMap, *};
+use concordium_cis2::*;
+use concordium_std::*;
 
 /// The state tracked for each address.
 #[derive(Serialize, SchemaType)]
 struct PlayerData {
     /// The player's state
     state: PlayerState,
-    /// The player's battle result
-    results: Vec<BattleResult>,
+    /// The player's wins
+    wins: u64,
+    /// The player's losses
+    losses: u64,
 }
 
 /// The parameter type for the state contract function `updatePlayerState`.
@@ -30,8 +32,7 @@ struct UpdateBattleResultParams {
 }
 
 /// List of supported standards by this contract address.
-const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 2] =
-    [CIS0_STANDARD_IDENTIFIER, CIS2_STANDARD_IDENTIFIER];
+const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 0] = [];
 
 /// The contract state.
 #[derive(Serial, DeserialWithState, StateClone)]
@@ -52,14 +53,12 @@ struct State<S: HasStateApi> {
 
 #[derive(Debug, Serialize, SchemaType, Clone, Copy, PartialEq)]
 enum PlayerState {
-    NotAdded,
     Active,
     Suspended,
 }
 
 #[derive(Debug, Serialize, SchemaType, Clone, Copy)]
 enum BattleResult {
-    NoResult,
     Win,
     Loss,
 }
@@ -110,6 +109,16 @@ struct NewAdminEvent {
     new_admin: Address,
 }
 
+/// A BattleResultEvent introduced by this smart contract.
+/// This event is emitted when a player's battle result is updated.
+#[derive(Serial, SchemaType)]
+struct BattleResultEvent {
+    /// Player address.
+    player: Address,
+    /// Player's new battle result.
+    is_win: bool,
+}
+
 /// Contract errors
 #[derive(Debug, PartialEq, Eq, Reject, Serial, SchemaType)]
 enum CustomContractError {
@@ -120,12 +129,12 @@ enum CustomContractError {
     LogFull,
     /// Failed logging: Log is malformed.
     LogMalformed,
+    /// The caller is not the admin.
+    Unauthorized,
     /// Contract is paused.
     ContractPaused,
     /// Failed to invoke a contract.
     InvokeContractError,
-    /// Failed to invoke a transfer.
-    InvokeTransferError,
     /// Upgrade failed because the new module does not exist.
     FailedUpgradeMissingModule,
     /// Upgrade failed because the new module does not contain a contract with a
@@ -136,9 +145,9 @@ enum CustomContractError {
     FailedUpgradeUnsupportedModuleVersion,
 }
 
-type ContractError = Cis2Error<CustomContractError>;
+type ContractError = CustomContractError;
 
-type ContractResult<A> = Result<A, ContractError>;
+type ContractResult<A> = Result<A, CustomContractError>;
 
 /// Mapping the logging errors to ContractError.
 impl From<LogError> for CustomContractError {
@@ -150,11 +159,9 @@ impl From<LogError> for CustomContractError {
     }
 }
 
-/// Mapping errors related to contract invocations to ContractError.
+/// Mapping errors related to contract invocations to CustomContractError.
 impl<T> From<CallContractError<T>> for CustomContractError {
-    fn from(_cce: CallContractError<T>) -> Self {
-        Self::InvokeContractError
-    }
+    fn from(_cce: CallContractError<T>) -> Self { Self::InvokeContractError }
 }
 
 /// Mapping errors related to contract upgrades to CustomContractError.
@@ -206,16 +213,21 @@ impl<S: HasStateApi> State<S> {
 // Contract functions
 
 /// Init function that creates a new smart contract.
-#[init(contract = "Versus-League-Manager")]
+#[init(contract = "Versus-League-Manager", enable_logger)]
 fn contract_init<S: HasStateApi>(
-    _ctx: &impl HasInitContext,
+    ctx: &impl HasInitContext,
     state_builder: &mut StateBuilder<S>,
+    logger: &mut impl HasLogger,
 ) -> InitResult<State<S>> {
     // Get the instantiator of this contract instance to be used as the initial
     // admin.
-    let invoker = Address::Account(_ctx.init_origin());
+    let invoker = Address::Account(ctx.init_origin());
     // Construct the initial contract state.
     let state = State::new(state_builder, invoker);
+
+    logger.log(&NewAdminEvent {
+        new_admin: invoker,
+    })?;
 
     Ok(state)
 }
@@ -224,7 +236,7 @@ fn contract_init<S: HasStateApi>(
 #[receive(
     contract = "Versus-League-Manager",
     name = "setPlayerData",
-    parameter = "(Address, PlayerState, BattleResult)",
+    parameter = "(Address, PlayerState)",
     error = "CustomContractError",
     mutable
 )]
@@ -233,25 +245,32 @@ fn contract_state_set_player_data<S: HasStateApi>(
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
     // Check that contract is not paused.
-    ensure!(!host.state().paused, ContractError::Custom(CustomContractError::ContractPaused));
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+    // Check that only the admin is authorized to set player data.
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
 
-    let params: (Address, PlayerState, BattleResult) = ctx.parameter_cursor().get()?;
+    let params: (Address, PlayerState) = ctx.parameter_cursor().get()?;
 
-    //result should be empty vector
     let mut player_data = host
         .state_mut()
         .player_data
         .entry(params.0)
-        .or_insert_with(|| PlayerData {
-            state: PlayerState::Active,
-            results: Vec::new(),
+        .and_modify(|pd| pd.state = params.1)
+        .or_insert(PlayerData {
+            state: params.1,
+            wins: 0,
+            losses: 0,
         });
+
     player_data.state = params.1;
 
     Ok(())
 }
 
-/// Update player battle result.
 #[receive(
     contract = "Versus-League-Manager",
     name = "updateBattleResult",
@@ -259,23 +278,28 @@ fn contract_state_set_player_data<S: HasStateApi>(
     error = "CustomContractError",
     mutable
 )]
-fn contract_update_battle_result<S: HasStateApi>(
+fn update_battle_result<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
-    // Check that contract is not paused.
-    ensure!(!host.state().paused, ContractError::Custom(CustomContractError::ContractPaused));
-    
     let params: UpdateBattleResultParams = ctx.parameter_cursor().get()?;
-    let mut player_data = host
-        .state_mut()
-        .player_data
-        .entry(params.player)
-        .or_insert_with(|| PlayerData {
-            state: PlayerState::Active,
-            results: Vec::new(),
-        });
-    player_data.results.push(params.result);
+
+    let player_data = host.state_mut().player_data.get_mut(&params.player);
+    if player_data.is_none() {
+        return Ok(());
+    }
+
+    let mut player_data = player_data.unwrap();
+
+    match params.result {
+        BattleResult::Win => {
+            player_data.wins += 1;
+        }
+        BattleResult::Loss => {
+            player_data.losses += 1;
+        }
+        _ => (),
+    }
     Ok(())
 }
 
@@ -298,21 +322,20 @@ fn contract_state_get_paused<S: HasStateApi>(
     contract = "Versus-League-Manager",
     name = "getPlayerData",
     parameter = "Address",
-    return_value = "(PlayerState, BattleResult)",
+    return_value = "(PlayerState)",
     error = "CustomContractError"
 )]
 fn contract_state_get_player_data<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &impl HasHost<State<S>, StateApiType = S>,
-) -> ContractResult<(PlayerState, Vec<BattleResult>)> {
+) -> ContractResult<PlayerState> {
     let params: Address = ctx.parameter_cursor().get()?;
 
     let player = host.state().player_data.get(&params).unwrap();
 
-    Ok(( player.state, player.results.clone() ))
+    Ok(player.state)
 }
 
-/// Check if player is added.
 #[receive(
     contract = "Versus-League-Manager",
     name = "isAdded",
@@ -325,10 +348,9 @@ fn contract_state_is_added<S: HasStateApi>(
     host: &impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<bool> {
     let params: Address = ctx.parameter_cursor().get()?;
+    let player_data = host.state().player_data.get(&params);
 
-    let player_state = host.state().player_data.get(&params).unwrap().state;
-
-    Ok(player_state != PlayerState::NotAdded)
+    Ok(player_data.is_some())
 }
 
 /// Function to view state of the state contract.

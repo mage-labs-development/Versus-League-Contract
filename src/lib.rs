@@ -31,9 +31,6 @@ struct UpdateBattleResultParams {
     result: BattleResult,
 }
 
-/// List of supported standards by this contract address.
-const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 0] = [];
-
 /// The contract state.
 #[derive(Serial, DeserialWithState, StateClone)]
 #[concordium(state_parameter = "S")]
@@ -61,17 +58,6 @@ enum PlayerState {
 enum BattleResult {
     Win,
     Loss,
-}
-
-/// The parameter type for the contract function `setImplementors`.
-/// Takes a standard identifier and list of contract addresses providing
-/// implementations of this standard.
-#[derive(Debug, Serialize, SchemaType)]
-struct SetImplementorsParams {
-    /// The identifier for the standard.
-    id: StandardIdentifierOwned,
-    /// The addresses of the implementors of the standard.
-    implementors: Vec<ContractAddress>,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -109,6 +95,14 @@ struct NewAdminEvent {
     new_admin: Address,
 }
 
+#[derive(Serialize, SchemaType)]
+struct NewBattleResultEvent {
+    /// Player address.
+    player: Address,
+    /// Player's new battle result.
+    is_win: BattleResult,
+}
+
 /// A BattleResultEvent introduced by this smart contract.
 /// This event is emitted when a player's battle result is updated.
 #[derive(Serial, SchemaType)]
@@ -135,6 +129,8 @@ enum CustomContractError {
     ContractPaused,
     /// Failed to invoke a contract.
     InvokeContractError,
+    /// Player does not exist.
+    PlayerDoesNotExist,
     /// Upgrade failed because the new module does not exist.
     FailedUpgradeMissingModule,
     /// Upgrade failed because the new module does not contain a contract with a
@@ -191,23 +187,6 @@ impl<S: HasStateApi> State<S> {
         }
     }
 
-    /// Check if state contains any implementors for a given standard.
-    fn have_implementors(&self, std_id: &StandardIdentifierOwned) -> SupportResult {
-        if let Some(addresses) = self.implementors.get(std_id) {
-            SupportResult::SupportBy(addresses.to_vec())
-        } else {
-            SupportResult::NoSupport
-        }
-    }
-
-    /// Set implementors for a given standard.
-    fn set_implementors(
-        &mut self,
-        std_id: StandardIdentifierOwned,
-        implementors: Vec<ContractAddress>,
-    ) {
-        self.implementors.insert(std_id, implementors);
-    }
 }
 
 // Contract functions
@@ -238,7 +217,7 @@ fn contract_init<S: HasStateApi>(
     name = "setPlayerData",
     parameter = "(Address, PlayerState)",
     error = "CustomContractError",
-    mutable
+    mutable,
 )]
 fn contract_state_set_player_data<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
@@ -255,7 +234,7 @@ fn contract_state_set_player_data<S: HasStateApi>(
 
     let params: (Address, PlayerState) = ctx.parameter_cursor().get()?;
 
-    let mut player_data = host
+    host
         .state_mut()
         .player_data
         .entry(params.0)
@@ -266,8 +245,6 @@ fn contract_state_set_player_data<S: HasStateApi>(
             losses: 0,
         });
 
-    player_data.state = params.1;
-
     Ok(())
 }
 
@@ -276,12 +253,24 @@ fn contract_state_set_player_data<S: HasStateApi>(
     name = "updateBattleResult",
     parameter = "UpdateBattleResultParams",
     error = "CustomContractError",
-    mutable
+    mutable,
+    enable_logger
 )]
 fn update_battle_result<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
+    logger: &mut impl HasLogger,
 ) -> ContractResult<()> {
+
+    // Check that contract is not paused.
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+    // Check that only the admin is authorized to set player data.
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
+
     let params: UpdateBattleResultParams = ctx.parameter_cursor().get()?;
 
     let player_data = host.state_mut().player_data.get_mut(&params.player);
@@ -298,8 +287,13 @@ fn update_battle_result<S: HasStateApi>(
         BattleResult::Loss => {
             player_data.losses += 1;
         }
-        _ => (),
     }
+
+    logger.log(&NewBattleResultEvent {
+        player: params.player,
+        is_win: params.result,
+    })?;
+
     Ok(())
 }
 
@@ -331,9 +325,11 @@ fn contract_state_get_player_data<S: HasStateApi>(
 ) -> ContractResult<PlayerState> {
     let params: Address = ctx.parameter_cursor().get()?;
 
-    let player = host.state().player_data.get(&params).unwrap();
-
-    Ok(player.state)
+    let player = host.state().player_data.get(&params);
+    match player {
+        Some(player) => Ok(player.state),
+        None => Err(CustomContractError::PlayerDoesNotExist.into()),
+    }
 }
 
 #[receive(
@@ -371,66 +367,57 @@ fn contract_view<S: HasStateApi>(
     Ok(state)
 }
 
-/// Get the supported standards or addresses for a implementation given list of
-/// standard identifiers.
-///
-/// It rejects if:
-/// - It fails to parse the parameter.
+/// Set the admin of the contract instance.
 #[receive(
     contract = "Versus-League-Manager",
-    name = "supports",
-    parameter = "SupportsQueryParams",
-    return_value = "SupportsQueryResponse",
-    error = "CustomContractError"
-)]
-fn contract_supports<S: HasStateApi>(
-    ctx: &impl HasReceiveContext,
-    host: &impl HasHost<State<S>, StateApiType = S>,
-) -> ContractResult<SupportsQueryResponse> {
-    // Parse the parameter.
-    let params: SupportsQueryParams = ctx.parameter_cursor().get()?;
-
-    // Build the response.
-    let mut response = Vec::with_capacity(params.queries.len());
-    for std_id in params.queries {
-        if SUPPORTS_STANDARDS.contains(&std_id.as_standard_identifier()) {
-            response.push(SupportResult::Support);
-        } else {
-            response.push(host.state().have_implementors(&std_id));
-        }
-    }
-    let result = SupportsQueryResponse::from(response);
-    Ok(result)
-}
-
-/// Set the addresses for an implementation given a standard identifier and a
-/// list of contract addresses.
-///
-/// It rejects if:
-/// - Sender is not the admin of the contract instance.
-/// - It fails to parse the parameter.
-#[receive(
-    contract = "Versus-League-Manager",
-    name = "setImplementors",
-    parameter = "SetImplementorsParams",
-    error = "CustomContractError",
+    name = "updateAdmin",
+    parameter = "Address",
+    error = "ContractError",
+    enable_logger,
     mutable
 )]
-fn contract_set_implementor<S: HasStateApi>(
+fn contract_update_admin<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+    logger: &mut impl HasLogger,
+) -> ContractResult<()> {
+    // Check that only the current admin is authorized to update the admin address.
+    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+    
+    // Parse the parameter.
+    let new_admin = ctx.parameter_cursor().get()?;
+
+    // Update the admin variable.
+    host.state_mut().admin = new_admin;
+
+    logger.log(&NewAdminEvent {
+        new_admin: new_admin,
+    })?;
+
+    Ok(())
+}
+
+/// Pause or unpause the contract.
+#[receive(
+    contract = "Versus-League-Manager",
+    name = "setPaused",
+    parameter = "SetPausedParams",
+    error = "ContractError",
+    mutable
+)]
+fn contract_update_pause<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
-    // Check that only the admin is authorized to set implementors.
-    ensure_eq!(
-        ctx.sender(),
-        host.state().admin,
-        ContractError::Unauthorized
-    );
+    // Check that only the admin is authorized to pause/unpause the contract.
+    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+
     // Parse the parameter.
-    let params: SetImplementorsParams = ctx.parameter_cursor().get()?;
-    // Update the implementors in the state
-    host.state_mut()
-        .set_implementors(params.id, params.implementors);
+    let params: SetPausedParams = ctx.parameter_cursor().get()?;
+
+    // Update the paused variable.
+    host.state_mut().paused = params.paused;
+
     Ok(())
 }
 

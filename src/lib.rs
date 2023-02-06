@@ -467,3 +467,188 @@ fn contract_upgrade<S: HasStateApi>(
     }
     Ok(())
 }
+
+#[concordium_cfg_test]
+mod tests {
+    use super::*;
+    use test_infrastructure::*;
+
+    const ADMIN_ACCOUNT: AccountAddress = AccountAddress([2u8; 32]);
+    const ADMIN_ADDRESS: Address = Address::Account(ADMIN_ACCOUNT);
+    const NEW_ADMIN_ACCOUNT: AccountAddress = AccountAddress([3u8; 32]);
+    const NEW_ADMIN_ADDRESS: Address = Address::Account(NEW_ADMIN_ACCOUNT);
+
+
+    /// Test admin can update to a new admin address.
+    #[concordium_test]
+    fn test_update_admin() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+        let mut logger = TestLogger::init();
+
+        // Set up the parameter.
+        let parameter_bytes = to_bytes(&[NEW_ADMIN_ADDRESS]);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be the old admin address");
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_update_admin(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, NEW_ADMIN_ADDRESS, "Admin should be the new admin address");
+
+        // Check the logs
+        claim_eq!(logger.logs.len(), 1, "Exactly one event should be logged");
+
+        // Check the event
+        claim!(
+            logger.logs.contains(&to_bytes(&WccdEvent::NewAdmin(NewAdminEvent {
+                new_admin: NEW_ADMIN_ADDRESS,
+            }))),
+            "Missing event for the new admin"
+        );
+    }
+
+    /// Test that only the current admin can update the admin address.
+    #[concordium_test]
+    fn test_update_admin_not_authorized() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        // NEW_ADMIN is not the current admin but tries to update the admin variable to
+        // its own address.
+        ctx.set_sender(NEW_ADMIN_ADDRESS);
+        let mut logger = TestLogger::init();
+
+        // Set up the parameter.
+        let parameter_bytes = to_bytes(&[NEW_ADMIN_ADDRESS]);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be the old admin address");
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_update_admin(&ctx, &mut host, &mut logger);
+
+        // Check that invoke failed.
+        claim_eq!(
+            result,
+            Err(ContractError::Unauthorized),
+            "Update admin should fail because not the current admin tries to update"
+        );
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be still the old admin address");
+    }
+
+    /// Test pausing the contract.
+    #[concordium_test]
+    fn test_pause() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Set up the parameter to pause the contract.
+        let parameter_bytes = to_bytes(&true);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check contract is paused.
+        claim_eq!(host.state().paused, true, "Smart contract should be paused");
+    }
+
+    /// Test unpausing the contract.
+    #[concordium_test]
+    fn test_unpause() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Set up the parameter to pause the contract.
+        let parameter_bytes = to_bytes(&true);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check contract is paused.
+        claim_eq!(host.state().paused, true, "Smart contract should be paused");
+
+        // Set up the parameter to unpause the contract.
+        let parameter_bytes = to_bytes(&false);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check contract is unpaused.
+        claim_eq!(host.state().paused, false, "Smart contract should be unpaused");
+    }
+
+    /// Test that only the current admin can pause/unpause the contract.
+    #[concordium_test]
+    fn test_pause_not_authorized() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        // NEW_ADMIN is not the current admin but tries to pause/unpause the contract.
+        ctx.set_sender(NEW_ADMIN_ADDRESS);
+
+        // Set up the parameter to pause the contract.
+        let parameter_bytes = to_bytes(&true);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check that invoke failed.
+        claim_eq!(
+            result,
+            Err(ContractError::Unauthorized),
+            "Pause should fail because not the current admin tries to invoke it"
+        );
+    }
+
+   
+
+}
